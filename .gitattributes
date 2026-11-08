@@ -1,0 +1,15 @@
+# Store text files with LF line endings in the repository and check them out with
+# LF on every OS. Shell scripts and Dockerfiles run inside Linux containers, where
+# Windows CRLF line endings break them.
+* text=auto eol=lf
+
+*.sh        text eol=lf
+Dockerfile  text eol=lf
+
+# Binary files: never touch line endings
+*.jpg   binary
+*.jpeg  binary
+*.png   binary
+*.webp  binary
+*.ico   binary
+*.bin   binary
