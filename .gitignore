@@ -1,0 +1,14 @@
+# secrets / local settings
+.env
+
+# python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+*.sqlite3
+staticfiles/
+
+# node
+node_modules/
+.next/

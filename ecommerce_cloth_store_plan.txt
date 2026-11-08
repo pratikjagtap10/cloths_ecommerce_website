@@ -1,0 +1,350 @@
+==========================================================================================
+        E-COMMERCE CLOTH STORE  -  LOCAL DEVELOPMENT PLAN (MICROSERVICE ARCHITECTURE)
+        Stack: Next.js + React | Python + Django | FastAPI | PostgreSQL | Redis | Docker
+==========================================================================================
+
+GOAL
+----
+Build a working clothing store on your local machine that covers the basic concepts of
+frontend, backend and microservice communication, packaged with Docker for shipping.
+
+The project is split into separate services. Each one has its own code, its own
+Dockerfile and its own job:
+
+  1. FRONTEND SERVICE   -> Next.js (React) - the storefront UI
+  2. BACKEND SERVICE A  -> Django + Django REST Framework (DRF) - "Core Service"
+                           (users, auth, product catalog, orders, admin panel)
+  3. BACKEND SERVICE B  -> FastAPI - "Cart & Payment Service"
+                           (cart, checkout, mock payment, inventory check, notifications)
+
+Supporting containers: PostgreSQL (database), Redis (cache + message broker),
+Nginx (API gateway / reverse proxy).
+
+
+==========================================================================================
+1. HIGH-LEVEL ARCHITECTURE
+==========================================================================================
+
+                         +------------------------+
+     Browser  ---------> |   NGINX (API Gateway)  |  :80
+                         +-----------+------------+
+                                     |
+         +---------------------------+------------------------------+
+         | /                         | /api/core/*                  | /api/shop/*
+         v                           v                              v
+ +----------------+        +--------------------+  REST (sync)  +----------------------+
+ |  FRONTEND      |        |  CORE SERVICE      | <-----------> |  CART/PAYMENT SVC    |
+ |  Next.js :3000 |        |  Django DRF :8000  |               |  FastAPI :8001       |
+ +----------------+        +---------+----------+               +----------+-----------+
+                                     |                                     |
+                                     |      Redis Pub/Sub / Queue (async)  |
+                                     +---------------> REDIS <-------------+
+                                     |                 :6379               |
+                              +------+------+                       +------+------+
+                              | Postgres DB |                       | Postgres DB |
+                              |  core_db    |                       |  shop_db    |
+                              +-------------+                       +-------------+
+
+Key rule of microservices: "database per service". Django never reads shop_db, and
+FastAPI never reads core_db. They only talk through APIs or events.
+
+
+==========================================================================================
+2. FOLDER STRUCTURE
+==========================================================================================
+
+ecommerce_demo/
+|-- docker-compose.yml              # runs everything together
+|-- .env                            # shared env variables (never commit real secrets)
+|-- nginx/
+|   |-- nginx.conf                  # gateway routing rules
+|
+|-- frontend/                       # SERVICE 1 - Next.js
+|   |-- Dockerfile
+|   |-- package.json
+|   |-- next.config.js
+|   |-- src/
+|       |-- app/                    # App Router pages
+|       |   |-- layout.tsx
+|       |   |-- page.tsx            # Home
+|       |   |-- products/page.tsx   # Product listing
+|       |   |-- products/[slug]/page.tsx   # Product detail (dynamic route)
+|       |   |-- cart/page.tsx
+|       |   |-- checkout/page.tsx
+|       |   |-- login/page.tsx
+|       |   |-- register/page.tsx
+|       |   |-- orders/page.tsx
+|       |-- components/             # Navbar, ProductCard, Filters, CartItem, Footer...
+|       |-- context/                # AuthContext, CartContext
+|       |-- hooks/                  # useAuth, useCart, useFetch
+|       |-- lib/api.ts              # API client (fetch/axios wrapper)
+|       |-- types/                  # TypeScript types (Product, Order, User)
+|
+|-- core_service/                   # SERVICE 2 - Django
+|   |-- Dockerfile
+|   |-- requirements.txt
+|   |-- manage.py
+|   |-- core/                       # project settings, urls, wsgi
+|   |-- users/                      # custom user model, register/login, JWT
+|   |-- catalog/                    # Category, Product, ProductVariant (size/color), images
+|   |-- orders/                     # Order, OrderItem
+|   |-- events/                     # Redis publisher/subscriber code
+|
+|-- shop_service/                   # SERVICE 3 - FastAPI
+    |-- Dockerfile
+    |-- requirements.txt
+    |-- app/
+        |-- main.py                 # FastAPI app entry
+        |-- config.py               # settings via pydantic-settings
+        |-- database.py             # SQLAlchemy engine / session
+        |-- models/                 # Cart, CartItem, Payment (SQLAlchemy)
+        |-- schemas/                # Pydantic request/response models
+        |-- routers/                # cart.py, checkout.py, payment.py
+        |-- services/               # core_client.py (calls Django), events.py
+        |-- deps.py                 # dependency injection (current user, db session)
+        |-- tests/
+
+
+==========================================================================================
+3. PHASE-WISE DEVELOPMENT PLAN
+==========================================================================================
+
+------------------------------------------------------------------------------------------
+PHASE 0 - SETUP (Day 1)
+------------------------------------------------------------------------------------------
+[ ] Install: Node.js 20+, Python 3.12+, Docker Desktop, Git, VS Code
+[ ] git init, add .gitignore (node_modules, __pycache__, .env, .venv, .next)
+[ ] Create the folder structure above
+[ ] Create Python virtual environments for local (non-docker) runs
+[ ] Learn concepts: client/server, HTTP methods, status codes, JSON, REST
+
+------------------------------------------------------------------------------------------
+PHASE 1 - CORE SERVICE: DJANGO (Days 2-5)
+------------------------------------------------------------------------------------------
+Concepts covered: MVC/MVT, ORM, migrations, models & relations, serializers, viewsets,
+routers, authentication, permissions, pagination, filtering, admin panel, CORS.
+
+[ ] django-admin startproject core ; apps: users, catalog, orders
+[ ] Connect to PostgreSQL (psycopg) via env variables
+[ ] Models:
+      User (custom, email login)
+      Category(name, slug, parent)                      -> self relation (Men > Shirts)
+      Product(name, slug, description, category FK, base_price, is_active, created_at)
+      ProductVariant(product FK, size [S/M/L/XL], color, sku, stock, price_override)
+      ProductImage(product FK, image, alt_text)
+      Order(user FK, status [PENDING/PAID/SHIPPED/CANCELLED], total, address, created_at)
+      OrderItem(order FK, variant FK, quantity, unit_price)
+[ ] makemigrations / migrate ; register models in Django Admin (product management)
+[ ] DRF serializers (nested: product with variants + images)
+[ ] Endpoints:
+      POST /api/core/auth/register/
+      POST /api/core/auth/login/            -> returns JWT (djangorestframework-simplejwt)
+      POST /api/core/auth/refresh/
+      GET  /api/core/auth/me/
+      GET  /api/core/categories/
+      GET  /api/core/products/?category=&size=&color=&min_price=&max_price=&search=&ordering=
+      GET  /api/core/products/{slug}/
+      GET  /api/core/orders/                (logged-in user's orders)
+      GET  /api/core/orders/{id}/
+    Internal (service-to-service only, protected by INTERNAL_API_KEY header):
+      GET  /internal/variants/{id}/         -> price + stock check
+      POST /internal/orders/                -> create order from FastAPI checkout
+[ ] Permissions: IsAuthenticated, IsAdminUser, object-level (own orders only)
+[ ] Pagination (PageNumberPagination), filtering (django-filter), search, ordering
+[ ] django-cors-headers for local frontend
+[ ] Seed command: python manage.py seed_products (sample shirts, jeans, dresses...)
+[ ] Tests with pytest-django
+
+------------------------------------------------------------------------------------------
+PHASE 2 - CART & PAYMENT SERVICE: FASTAPI (Days 6-9)
+------------------------------------------------------------------------------------------
+Concepts covered: async Python, path/query/body params, Pydantic validation, dependency
+injection, SQLAlchemy ORM, Alembic migrations, JWT verification, OpenAPI docs (/docs),
+background tasks, HTTP client calls to another service.
+
+[ ] FastAPI app + uvicorn ; SQLAlchemy + Alembic connected to shop_db
+[ ] Models:
+      Cart(id, user_id, created_at)          -> user_id is just a number (no FK across DBs!)
+      CartItem(cart FK, variant_id, quantity, unit_price_snapshot)
+      Payment(id, order_id, user_id, amount, status, provider_ref, created_at)
+[ ] Auth: verify the SAME JWT issued by Django (shared JWT_SECRET / signing key)
+      -> deps.get_current_user() decodes token, returns user_id
+[ ] Endpoints:
+      GET    /api/shop/cart/
+      POST   /api/shop/cart/items/           {variant_id, quantity}
+      PATCH  /api/shop/cart/items/{id}/      {quantity}
+      DELETE /api/shop/cart/items/{id}/
+      POST   /api/shop/checkout/             {address}   -> returns order + payment
+      POST   /api/shop/payments/{id}/confirm/  (MOCK payment - success/fail)
+      GET    /api/shop/health/
+[ ] services/core_client.py using httpx.AsyncClient:
+      - before adding to cart -> GET Django /internal/variants/{id}/ (price, stock)
+      - on checkout          -> POST Django /internal/orders/
+[ ] Timeouts + retries + error handling when Django is down (return 503 gracefully)
+[ ] BackgroundTasks: send "order confirmation email" (just log/print locally)
+[ ] Tests with pytest + httpx TestClient (mock the core service calls)
+
+------------------------------------------------------------------------------------------
+PHASE 3 - MICROSERVICE COMMUNICATION (Days 10-11)
+------------------------------------------------------------------------------------------
+Learn BOTH styles:
+
+A) SYNCHRONOUS (Request/Response over REST)
+   - FastAPI -> Django: "Is this variant in stock? What is its price?"
+   - Caller waits for the answer. Simple, but couples services (if Django is down,
+     cart add fails).
+   - Secure with an internal API key header: X-Internal-Key
+   - Use service names as hostnames inside Docker: http://core_service:8000
+
+B) ASYNCHRONOUS (Event-driven via Redis Pub/Sub, or Redis Streams / Celery)
+   - FastAPI publishes event:  "payment.succeeded" {order_id, amount}
+   - Django subscriber listens -> updates Order.status = PAID and reduces variant stock
+   - Django publishes event:   "order.shipped" {order_id, user_id}
+   - FastAPI (or a worker) listens -> logs notification
+   - Caller does NOT wait. Services are loosely coupled.
+
+C) SHARED AUTHENTICATION
+   - Django issues JWT -> frontend stores it -> sends "Authorization: Bearer <token>"
+     to BOTH services -> each service verifies independently.
+
+D) API GATEWAY (Nginx)
+   - One entry point for the browser (localhost)
+   - Routes /api/core/* -> Django, /api/shop/* -> FastAPI, / -> Next.js
+   - Avoids CORS headaches and hides internal service ports
+
+Checkout flow (end-to-end):
+   1. User clicks "Place Order" in Next.js
+   2. Next.js -> POST /api/shop/checkout/ (via Nginx)
+   3. FastAPI reads cart -> calls Django /internal/variants/ to re-verify stock & price
+   4. FastAPI -> POST Django /internal/orders/  (order created, status PENDING)
+   5. FastAPI creates Payment (PENDING) -> returns to frontend
+   6. User confirms mock payment -> FastAPI marks Payment SUCCESS
+   7. FastAPI publishes "payment.succeeded" to Redis
+   8. Django subscriber -> Order = PAID, stock reduced
+   9. FastAPI clears cart, background task "sends" confirmation email
+  10. Frontend shows Order Success page -> fetches order from Django
+
+------------------------------------------------------------------------------------------
+PHASE 4 - FRONTEND: NEXT.JS + REACT (Days 12-17)
+------------------------------------------------------------------------------------------
+Concepts covered: components, props, state (useState), effects (useEffect), Context API,
+custom hooks, forms & validation, conditional rendering, lists & keys, routing (App Router),
+dynamic routes, layouts, Server vs Client Components, SSR / SSG / ISR, data fetching,
+loading & error states, protected routes, environment variables, responsive CSS.
+
+[ ] npx create-next-app@latest frontend (TypeScript, App Router, Tailwind CSS, ESLint)
+[ ] Layout: Navbar (logo, categories, search, cart badge, login/user menu), Footer
+[ ] Pages:
+      Home            -> hero banner, featured products, categories   (SSG/ISR)
+      Product List    -> grid, filters (category/size/color/price), sort,
+                         pagination, search                            (SSR)
+      Product Detail  -> image gallery, choose size & color, add to cart (dynamic route)
+      Cart            -> update qty, remove item, subtotal              (Client)
+      Checkout        -> address form + validation, place order, mock payment
+      Login/Register  -> forms, error messages, store JWT
+      My Orders       -> order history (protected route)
+      Order Success   -> confirmation
+      404 / error.tsx / loading.tsx
+[ ] lib/api.ts: base URL from NEXT_PUBLIC_API_URL, attach JWT, handle 401 -> refresh
+[ ] AuthContext (user, login, logout) ; CartContext (items, count, add/remove)
+[ ] Middleware (middleware.ts) to protect /orders and /checkout
+[ ] Form validation (react-hook-form + zod)
+[ ] Responsive design (mobile-first), accessibility (alt text, labels)
+[ ] Optional: React Query / SWR for caching and refetching
+
+------------------------------------------------------------------------------------------
+PHASE 5 - DOCKER & SHIPPING (Days 18-20)
+------------------------------------------------------------------------------------------
+Concepts covered: images vs containers, Dockerfile, layers & caching, multi-stage builds,
+docker-compose, networks, volumes, environment variables, health checks, depends_on.
+
+[ ] frontend/Dockerfile      (multi-stage: node build -> node:alpine runtime,
+                              output: "standalone" in next.config.js)
+[ ] core_service/Dockerfile  (python:3.12-slim, pip install, gunicorn core.wsgi)
+[ ] shop_service/Dockerfile  (python:3.12-slim, uvicorn app.main:app)
+[ ] .dockerignore in each service
+[ ] docker-compose.yml services:
+      nginx          -> ports 80:80, depends on frontend, core_service, shop_service
+      frontend       -> 3000
+      core_service   -> 8000, depends on core_db, redis
+      core_worker    -> same image as core_service, runs the Redis event subscriber
+      shop_service   -> 8001, depends on shop_db, redis, core_service
+      core_db        -> postgres:16, volume core_db_data
+      shop_db        -> postgres:16, volume shop_db_data
+      redis          -> redis:7-alpine
+[ ] Health checks (pg_isready, /health endpoints)
+[ ] Entry scripts: run migrations on startup (Django migrate, Alembic upgrade head)
+[ ] Commands:
+      docker compose up --build          # start everything
+      docker compose logs -f shop_service
+      docker compose exec core_service python manage.py createsuperuser
+      docker compose exec core_service python manage.py seed_products
+      docker compose down -v             # stop + delete volumes
+[ ] "Shipping": tag & push images to Docker Hub / GitHub Container Registry
+      docker build -t <user>/cloth-frontend:1.0 ./frontend
+      docker push <user>/cloth-frontend:1.0
+
+------------------------------------------------------------------------------------------
+PHASE 6 - QUALITY, SECURITY & POLISH (Days 21-23)
+------------------------------------------------------------------------------------------
+[ ] Logging in every service (with request/correlation ID passed via X-Request-ID header)
+[ ] Centralized error format: {"error": "...", "detail": "..."}
+[ ] Rate limiting in Nginx for /auth/login
+[ ] Password hashing (Django default), HTTPS note for production, secrets in .env
+[ ] Input validation everywhere (DRF serializers, Pydantic)
+[ ] Unit + integration tests; one end-to-end test (Playwright) for checkout
+[ ] Optional: GitHub Actions CI -> lint + test + docker build
+[ ] README.md with setup steps and architecture diagram
+
+
+==========================================================================================
+4. ENVIRONMENT VARIABLES (.env example)
+==========================================================================================
+# shared
+JWT_SECRET=change-me-dev-only
+INTERNAL_API_KEY=change-me-internal
+REDIS_URL=redis://redis:6379/0
+
+# core service (Django)
+DJANGO_SECRET_KEY=change-me
+DJANGO_DEBUG=1
+CORE_DB_URL=postgres://core:core@core_db:5432/core_db
+
+# shop service (FastAPI)
+SHOP_DB_URL=postgresql+psycopg://shop:shop@shop_db:5432/shop_db
+CORE_SERVICE_URL=http://core_service:8000
+
+# frontend
+NEXT_PUBLIC_API_URL=http://localhost/api
+
+
+==========================================================================================
+5. CONCEPT CHECKLIST (what you will have learned)
+==========================================================================================
+FRONTEND                               BACKEND                      MICROSERVICES / DEVOPS
+-------------------------------        ---------------------------  ---------------------------
+[ ] JSX & components                   [ ] REST API design          [ ] Service boundaries
+[ ] Props / state / hooks              [ ] ORM & migrations         [ ] Database per service
+[ ] Context API                        [ ] Model relationships      [ ] Sync REST calls
+[ ] Routing & dynamic routes           [ ] Serializers / Pydantic   [ ] Async events (Redis)
+[ ] SSR / SSG / ISR / CSR              [ ] JWT authentication       [ ] Shared JWT auth
+[ ] Data fetching & caching            [ ] Permissions              [ ] API gateway (Nginx)
+[ ] Forms & validation                 [ ] Pagination/filter/search [ ] Internal API keys
+[ ] Protected routes / middleware      [ ] Async Python (FastAPI)   [ ] Timeouts/retries/503
+[ ] Loading & error UI                 [ ] Dependency injection     [ ] Dockerfile & compose
+[ ] Responsive styling (Tailwind)      [ ] Background tasks         [ ] Volumes & networks
+[ ] Environment variables              [ ] Admin panel              [ ] Health checks
+[ ] TypeScript types                   [ ] Testing (pytest)         [ ] Push images (shipping)
+
+
+==========================================================================================
+6. TIMELINE SUMMARY
+==========================================================================================
+Week 1 : Phase 0-1  -> Setup + Django core service (auth, catalog, orders)
+Week 2 : Phase 2-3  -> FastAPI cart/payment + service communication (REST + Redis events)
+Week 3 : Phase 4    -> Next.js storefront
+Week 4 : Phase 5-6  -> Docker, compose, shipping images, testing & polish
+
+Tip: Build vertically. Get ONE feature working end-to-end first (e.g. "list products"
+from Django -> shown in Next.js -> running in Docker), then add the next feature.
+==========================================================================================
