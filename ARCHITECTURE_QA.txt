@@ -1,0 +1,506 @@
+==========================================================================================
+   THREADS CLOTH STORE - ARCHITECTURE Q&A
+   Service communication & failure handling, scaling to 1M users, slow-internet images,
+   caching, and API security
+==========================================================================================
+
+Contents
+  0. Overview: how the microservices communicate, and what happens when one is down
+  1. How would we scale the application for 1 million users?
+  2. Slow internet: detect the speed first, then decide how to render product images
+     (IMPLEMENTED in the frontend, see section 2.4)
+  3. Which caching mechanisms can improve performance for the user?
+  4. How do we make sure only valid users can use our APIs (protection from hackers)?
+
+Legend:  [HAVE] = already implemented in this project
+         [ADD]  = recommended next step
+
+
+==========================================================================================
+0. OVERVIEW - HOW THE MICROSERVICES COMMUNICATE
+==========================================================================================
+
+0.1 The services
+----------------
+  nginx         API gateway, the single entry point (http://localhost)
+  frontend      Next.js storefront
+  core_service  Django: users + JWT login, catalog, stock, orders, admin   -> core_db
+  core_worker   Django event consumer (same code, different command)       -> core_db
+  shop_service  FastAPI: cart, checkout, payments                          -> shop_db
+  redis         message bus (Pub/Sub channel "events")
+
+  Rule: database per service. A service only reads/writes its own database.
+
+0.2 The four ways they talk
+---------------------------
+ A) Browser -> Gateway -> Service (HTTP/REST)
+      /api/core/* -> Django, /api/shop/* -> FastAPI, / -> Next.js, /internal/* -> blocked
+
+ B) Service -> Service, SYNCHRONOUS (HTTP, caller waits)
+      shop_service -> core_service internal API, header X-Internal-Key: <secret>
+        GET  /internal/variants/{id}/   price + stock before adding to the cart
+        POST /internal/orders/          create the order at checkout (Django re-checks
+                                        stock with row locks and uses its own prices)
+
+ C) Service -> Service, ASYNCHRONOUS (events on Redis, publisher doesn't wait)
+        payment.succeeded : shop_service  -> core_worker  (order PAID, stock reduced)
+        order.shipped     : core (admin)  -> shop_service (mock "shipped" email)
+
+ D) Shared identity, with NO call at all (JWT)
+      Django signs the token with JWT_SECRET; FastAPI verifies it with the same secret.
+
+      Browser --login--> Django --JWT--> Browser --Bearer JWT--> FastAPI (verifies locally)
+
+0.3 What happens today when a service is down
+---------------------------------------------
+ Service down   | What the user sees / what happens
+ ---------------+-------------------------------------------------------------------------
+ core_service   | - Catalog pages can't load: the server-rendered pages need the catalog
+                |   API, so they show an error page.
+                | - Login / register / my orders fail (Nginx answers 502).
+                | - Add to cart / checkout: FastAPI retries, then returns a clean
+                |   503 "Catalog service is unavailable. Please try again shortly."
+                |   It takes ~10 s, because each DNS lookup of the stopped container
+                |   times out before the retry.
+                | - Viewing the cart and confirming a payment STILL WORK (they don't need
+                |   Django). The payment event is still processed by core_worker, which
+                |   talks to core_db directly.
+ core_worker    | - Payments succeed, but the order stays PENDING: the Pub/Sub message is
+                |   lost because nobody was listening. Docker restarts the worker
+                |   (restart: unless-stopped), but lost messages are not replayed.
+ shop_service   | - Browsing, login and order history work.
+                | - Cart/checkout fail with 502 from Nginx; the UI shows an error message
+                |   and an empty cart.
+ redis          | - Payment succeeds but publishing fails (logged): order stays PENDING.
+                | - Listeners reconnect automatically every 3 s.
+                | - Shop health shows "degraded".
+ core_db        | - Core health check returns 503: Docker marks it unhealthy; API calls fail.
+ nginx          | - Site unreachable (services still reachable directly on :8000/:8001).
+ frontend       | - UI down, APIs still work (Postman/mobile apps unaffected).
+
+0.4 Failure-handling mechanisms
+-------------------------------
+ [HAVE] Timeouts on every service-to-service call (3 s): a slow service can't hang ours
+ [HAVE] Retries with exponential backoff (0.2 s, 0.4 s) for connection errors
+ [HAVE] NO retry of POST /internal/orders/ after a timeout (prevents duplicate orders)
+ [HAVE] Graceful errors: 503 with a readable {"detail": "..."} instead of a crash/500
+ [HAVE] Idempotent operations: paying twice or receiving an event twice changes nothing
+ [HAVE] Health checks (/api/core/health/, /api/shop/health/ check DB + Redis)
+ [HAVE] restart: unless-stopped, and depends_on: service_healthy for start-up order
+ [HAVE] Event listeners reconnect to Redis in a loop
+ [HAVE] Nginx re-resolves container names via Docker DNS (no stale IPs after a restart)
+ [HAVE] Frontend: error boundary page, error messages per action, 401 -> token refresh
+
+ [ADD] CIRCUIT BREAKER around CoreClient: after N failures, fail INSTANTLY for 30 s
+       instead of waiting ~10 s on every request. Then "half-open": try one request,
+       and close again if it succeeds.
+         CLOSED --(5 failures)--> OPEN (fail fast) --(30 s)--> HALF-OPEN --(ok)--> CLOSED
+ [ADD] DURABLE MESSAGING: Redis Streams (XADD / XREADGROUP / XACK), RabbitMQ or Kafka,
+       so events wait in a queue until the worker processes and acknowledges them.
+ [ADD] TRANSACTIONAL OUTBOX: write the event into an "outbox" table in the SAME DB
+       transaction as the payment; a relay process publishes it later. Even if Redis
+       is down at payment time, the event can never be lost.
+ [ADD] RECONCILIATION JOB: every few minutes, find payments=SUCCESS whose order is
+       still PENDING and re-publish (safety net).
+ [ADD] GRACEFUL DEGRADATION in the UI: cache the last known catalog (see section 3) so
+       browsing still works when Django is down; add app/global-error.tsx for
+       layout-level errors.
+ [ADD] Run 2+ replicas of every service behind a load balancer, so one crashed
+       container is invisible to users (section 1).
+ [ADD] Monitoring and alerts: Prometheus + Grafana dashboards, alert on error rate,
+       latency, queue length and unhealthy containers; centralised logs searchable by
+       the X-Request-ID that Nginx already adds.
+
+
+==========================================================================================
+1. HOW WOULD WE SCALE THE APPLICATION FOR 1 MILLION USERS?
+==========================================================================================
+
+1.1 First, turn "1 million users" into numbers (assumptions)
+------------------------------------------------------------
+  Registered users              1,000,000
+  Daily active (~10%)             100,000
+  Peak concurrent (~5-10%)      5,000 - 10,000 users online at once
+  Requests per active user      ~1 every 10-20 s while browsing
+  => Peak traffic               ~500 - 1,000 requests/second (x5-10 during a sale)
+  Read : write ratio            ~95 : 5 (mostly browsing; few checkouts)
+  Orders/day (2-3% conversion)  ~2,000 - 3,000 (writes are NOT the hard part)
+
+  Conclusion: the challenge is serving READS (catalog, images, pages) fast and
+  cheaply, and surviving SPIKES (sales). Caching + horizontal scaling solve most of it.
+
+1.2 Target architecture
+-----------------------
+
+  Users -> DNS -> CDN (CloudFront/Cloudflare): static JS/CSS, images, cached pages
+                    |
+                    v
+           Load balancer / API gateway (+ WAF, rate limiting, TLS)
+             |                     |                       |
+     Next.js x N pods      core_service x N pods     shop_service x N pods
+     (autoscaled)          (autoscaled)              (autoscaled)
+             |                     |                       |
+             |             Redis cluster (cache)    Redis cluster (cache/sessions)
+             |                     |                       |
+             |        PostgreSQL primary + read replicas   PostgreSQL (shop)
+             |              via PgBouncer                   via PgBouncer
+             |                     |
+             |        Message broker (Kafka / RabbitMQ) <--> workers x N (Celery)
+             |
+     Search engine (OpenSearch/Elasticsearch) for product search & filters
+     Object storage (S3) + image CDN for product photos
+
+1.3 Layer by layer
+------------------
+ a) STATELESS SERVICES -> HORIZONTAL SCALING
+    [HAVE] Our services are already stateless: JWT auth (no server sessions), the cart
+           lives in the DB, config comes from env vars. Any replica can serve any request.
+    [ADD]  Run on Kubernetes (or AWS ECS) with a Horizontal Pod Autoscaler: e.g. scale
+           from 3 to 30 pods when CPU > 60% or latency rises.
+    [ADD]  Tune workers: gunicorn workers = 2 x CPU + 1; uvicorn with several workers;
+           readiness/liveness probes use our /health endpoints.
+
+ b) CDN + FRONTEND
+    [ADD]  Serve /_next/static, product images and optimised images from a CDN close
+           to the user (most bytes never reach our servers).
+    [ADD]  Catalog pages with ISR/edge caching (section 3): thousands of users hit the
+           same "Men's T-Shirts" page, so render it once and serve it from cache.
+
+ c) DATABASE (usually the first bottleneck)
+    [HAVE] Indexes (is_active/is_featured, unique slug/sku), select_related/
+           prefetch_related to avoid N+1 queries, row locks for stock.
+    [ADD]  PgBouncer connection pooling (thousands of pods x connections would
+           exhaust PostgreSQL otherwise).
+    [ADD]  Read replicas: catalog and order-history reads go to replicas; writes
+           (orders, stock) go to the primary. Django supports this with DB routers.
+    [ADD]  Managed DB (AWS RDS/Aurora) with automatic backups, Multi-AZ failover.
+    [ADD]  Later: partition the orders table by month; archive old orders.
+
+ d) CACHING (biggest win, see section 3): Redis for catalog/product JSON, HTTP
+    caching, CDN. Typical cache hit ratio for catalogs: 90%+, so the DB sees 10x less load.
+
+ e) SEARCH
+    [ADD]  Move product search/filters from SQL LIKE to OpenSearch/Elasticsearch
+           (fast full-text search, typo tolerance, facets like size/colour counts).
+
+ f) ASYNC WORK AND MESSAGING
+    [ADD]  Kafka/RabbitMQ instead of Pub/Sub (durable, scalable consumer groups:
+           run 10 workers that share the load).
+    [ADD]  Celery workers for emails, invoices, image processing, analytics.
+
+ g) FLASH SALES (spikes)
+    [ADD]  Virtual waiting room / queue in front of checkout.
+    [ADD]  Stock reservation with a short TTL (e.g. 10 min) in Redis, using atomic
+           DECR, so we don't lock DB rows for every visitor.
+    [ADD]  Pre-warm caches and pre-scale pods before a planned sale.
+
+ h) RELIABILITY
+    [ADD]  Multi-AZ deployment, at least 2 replicas of everything, circuit breakers,
+           rate limits per user/IP, graceful degradation (section 0.4).
+
+ i) OBSERVABILITY
+    [ADD]  Metrics (Prometheus/Grafana), tracing (OpenTelemetry, using X-Request-ID),
+           centralised logs (ELK/Loki), alerts. You can't scale what you can't see.
+
+1.4 How to do it step by step (don't over-engineer on day 1)
+-------------------------------------------------------------
+  Step 1  Measure: load test with k6 or Locust (e.g. 1,000 virtual users browsing +
+          checking out). Find the real bottleneck.
+  Step 2  Cheap wins: CDN, caching (section 3), DB indexes, PgBouncer.
+  Step 3  Horizontal scaling: containers to Kubernetes/ECS, 3+ replicas, autoscaling.
+  Step 4  DB read replicas, managed Postgres/Redis.
+  Step 5  Durable messaging (Kafka/RabbitMQ + outbox), Celery workers.
+  Step 6  Search engine, flash-sale features, multi-region if users are global.
+  After each step, load test again.
+
+
+==========================================================================================
+2. SLOW INTERNET: CHECK THE SPEED FIRST, THEN RENDER PRODUCT IMAGES ACCORDINGLY
+   >>> IMPLEMENTED in the frontend <<<
+==========================================================================================
+
+2.1 The idea
+------------
+Images are usually 60-80% of an e-commerce page's weight. On a slow connection we
+should not download large photos the user may not even look at. So:
+  1. Detect connection quality as cheaply as possible.
+  2. Choose an image "profile": no photo / small optimised photo / full-quality photo.
+  3. Always let the user override it.
+
+2.2 How the speed is detected (src/lib/network.ts)
+--------------------------------------------------
+  Step 1 - Network Information API (Chrome, Edge, Android, Samsung Internet)
+           navigator.connection gives, instantly and for free:
+             effectiveType: "slow-2g" | "2g" | "3g" | "4g"
+             downlink:      estimated Mbps
+             saveData:      true if the user enabled "Data Saver" in the browser/OS
+           We also listen for its "change" event (e.g. Wi-Fi -> mobile data).
+  Step 2 - Browsers without that API (Safari, Firefox): download a 100 KB test file
+           (/network-probe.bin, random bytes, never cached) ONCE per session after
+           the page has loaded, and compute Mbps = bits / seconds.
+           > 4 s timeout = treated as a slow connection.
+  Step 3 - Classification:
+             saveData ON, or 2G / slow-2G, or < 1 Mbps -> LOW
+             3G, or 1 - 5 Mbps                         -> MEDIUM
+             4G and >= 5 Mbps                          -> HIGH
+  Step 4 - User override in the top bar: "Images: Auto / Data saver / HD photos"
+           (remembered in localStorage). For demos/testing: add ?network=low,
+           ?network=medium or ?network=high to any URL.
+
+2.3 What is rendered for each quality (src/components/ProductImage.tsx)
+-----------------------------------------------------------------------
+  Quality    | What the user gets
+  -----------+------------------------------------------------------------------
+  detecting  | lightweight SVG illustration in the product colour (0 KB, no request)
+  LOW        | SVG illustration only. On the product page a "Load photo (data saver
+             | on)" button loads a small, quality-30 photo ONLY if the user asks
+  MEDIUM     | real photo, requested at ~60% of the display width, quality 45, WebP
+  HIGH       | real photo, full width, quality 80, WebP, priority-loaded on the
+             | product page
+
+  Plus, for everyone:
+   - next/image converts JPEG -> WebP, resizes to the exact width needed, and
+     lazy-loads images below the fold (they load only when scrolled into view).
+   - The illustration shows instantly as a placeholder; the photo fades in when ready.
+   - If a photo is missing or fails, the illustration stays (no broken image icon).
+
+  Measured on our generated photos (same product card image):
+     original JPEG 1000x1250 ............ 33,255 bytes
+     HIGH   (640 px, q80, WebP) .........  5,314 bytes
+     MEDIUM (384 px, q45, WebP) .........  1,748 bytes
+     LOW    (not downloaded) ............      0 bytes  (958 bytes if "Load photo")
+  With real studio photos (typically 200-500 KB each) the savings are far larger:
+  a 24-product listing page drops from several MB to well under 1 MB on MEDIUM, and to
+  almost nothing on LOW.
+
+2.4 Files changed / added in the frontend
+-----------------------------------------
+  src/lib/network.ts                 detection logic, classification, image profiles
+  src/context/NetworkContext.tsx     global state: quality, detected info, user preference
+  src/context/Providers.tsx          wraps the app with NetworkProvider
+  src/components/ProductImage.tsx    network-aware image (illustration/photo/on-demand)
+  src/components/NetworkIndicator.tsx  "Images: Auto / Data saver / HD" dropdown
+  src/components/Navbar.tsx          shows the indicator in the top bar
+  src/components/ProductCard.tsx, AddToCart.tsx, app/cart, app/orders/[id]
+                                     pass the photo URL + display width
+  src/lib/format.ts                  productImageSrc(slug, colour, images)
+  next.config.ts                     WebP, allowed qualities (30/45/80), 30-day image
+                                     cache, cache headers for /images, no-store for probe
+  public/images/products/*.jpg       34 product photos (one per product colour)
+  public/network-probe.bin           100 KB speed-test file
+
+2.5 How to see it working
+-------------------------
+  1. Rebuild: docker compose up --build -d frontend
+  2. http://localhost/products?network=high : photos; top bar shows "Fast connection"
+  3. http://localhost/products?network=low  : illustrations only; open a product to
+                                              see the "Load photo" button
+  4. Or use the "Images:" dropdown in the top bar (Data saver / HD photos).
+  5. DevTools > Network > filter "Img": compare bytes downloaded with each option.
+     Use throttling ("Slow 4G"/"3G") to feel the difference.
+  6. On a real phone with Data Saver enabled (Chrome/Android), Auto switches to LOW by itself.
+
+2.6 Other good practices for slow networks [ADD]
+------------------------------------------------
+  - Fewer products per page on LOW (e.g. 4 instead of 8), infinite scroll on demand.
+  - Tiny blurred placeholder (LQIP / BlurHash, ~200 bytes) instead of the illustration.
+  - Responsive "art direction": square crops for mobile.
+  - Service worker to cache the app shell and viewed products (works offline, PWA).
+  - Avoid heavy JS: we already server-render pages and keep client JS small.
+
+
+==========================================================================================
+3. CACHING - WHAT CAN WE USE TO IMPROVE PERFORMANCE AT THE USER END?
+==========================================================================================
+
+Golden rule: cache what is read often and changes rarely (catalog, images, static
+files). Never blindly cache what is personal or must be exact (cart, stock at checkout,
+orders, prices at payment time).
+
+3.1 Caching layers, from the user's device to the database
+----------------------------------------------------------
+
+ Layer               | What to cache                      | Status / how
+ --------------------+------------------------------------+--------------------------------
+ 1 Browser HTTP cache| JS/CSS (hashed names), images      | [HAVE] Next.js static files are
+                     |                                    | cached "immutable" for 1 year;
+                     |                                    | /images 1 day + stale-while-
+                     |                                    | revalidate; optimised images 30 days
+ 2 Client data cache | API responses in memory            | [ADD] React Query / SWR:
+   (in the app)      | (products, categories)             | stale-while-revalidate, dedupes
+                     |                                    | requests, instant back navigation
+ 3 Service worker    | app shell, viewed products, images | [ADD] PWA (next-pwa / Workbox),
+                     |                                    | works offline / on flaky networks
+ 4 CDN / edge        | static files, images, cached HTML  | [ADD] CloudFront / Cloudflare in
+                     | of catalog pages                   | front of Nginx; Cache-Control:
+                     |                                    | s-maxage=60, stale-while-revalidate
+ 5 Next.js server    | rendered pages + fetch results     | [HAVE] ISR in mock mode (home
+                     |                                    | revalidate=60); image optimiser cache.
+                     |                                    | [ADD] in real mode use
+                     |                                    | fetch(url, {next:{revalidate:60,
+                     |                                    | tags:["products"]}}) instead of
+                     |                                    | per-request rendering, plus
+                     |                                    | revalidateTag("products") when
+                     |                                    | the admin edits a product
+ 6 Gateway (Nginx)   | GET responses of public APIs       | [ADD] proxy_cache for
+                     |                                    | /api/core/products and
+                     |                                    | /api/core/categories (10-60 s micro-
+                     |                                    | cache absorbs traffic spikes)
+ 7 Application cache | categories, product list pages,    | [ADD] Django cache framework with
+   (Redis)           | product detail JSON                | Redis (we already run Redis):
+                     |                                    | cache_page / low-level cache.get/set
+ 8 Database          | query plans, hot rows in memory    | [HAVE] indexes; [ADD] tuned
+                     |                                    | shared_buffers, read replicas
+
+3.2 Example: Redis cache for the catalog in Django [ADD]
+--------------------------------------------------------
+  settings.py
+      CACHES = {"default": {"BACKEND": "django.core.cache.backends.redis.RedisCache",
+                            "LOCATION": REDIS_URL}}
+  catalog/views.py
+      from django.utils.decorators import method_decorator
+      from django.views.decorators.cache import cache_page
+      @method_decorator(cache_page(60), name="list")       # 60 s per unique URL
+      @method_decorator(cache_page(300), name="retrieve")
+      class ProductViewSet(...): ...
+  Invalidation: on product/variant save (admin), clear the related keys with a
+  post_save signal, or use short TTLs plus versioned keys.
+
+3.3 What NOT to cache (or only very briefly)
+--------------------------------------------
+  - Cart, orders, payments, /auth/me: personal. Never in a shared cache (CDN/Nginx).
+    Use "Cache-Control: private, no-store".
+  - Stock shown on the page may be ~60 s stale, but the CHECKOUT always re-checks live
+    stock in the DB with row locks [HAVE]. Cache for display, verify for money.
+  - Prices: Django recalculates them at order creation [HAVE], so a cached page can't
+    cause a wrong charge.
+
+3.4 Cache invalidation strategies
+---------------------------------
+  - TTL (time-to-live): simplest; accept data up to N seconds old.
+  - Event-based: product updated -> publish "product.updated" -> clear Redis keys and
+    call Next.js revalidateTag("products"). Our event bus already exists for this.
+  - stale-while-revalidate: serve the cached copy instantly, refresh in the background.
+  - Versioned / hashed URLs for assets: never need invalidation [HAVE for JS/CSS].
+
+3.5 Expected impact
+-------------------
+  - Repeat visits: most assets from the browser cache, near-instant.
+  - Catalog API: 90%+ cache hits means DB load / 10 and response times ~5 ms instead of ~50 ms.
+  - CDN: images and static files served from a city near the user, not our server.
+
+
+==========================================================================================
+4. API SECURITY - HOW TO MAKE SURE ONLY VALID USERS CAN USE OUR APIs
+==========================================================================================
+
+The goal: a request is accepted only if it comes from a real, authenticated user who
+is allowed to do that specific action, with valid data, at a reasonable rate. And
+anything sent from the browser can be forged, so the server must check everything.
+
+4.1 Defence in depth: the layers a request passes through
+
+  Internet -> [WAF / bot protection] -> [HTTPS] -> [Gateway: rate limit, block
+  /internal] -> [Authentication: who are you?] -> [Authorization: may you do this
+  to THIS object?] -> [Input validation] -> [Business rules] -> [Audit log]
+
+4.2 Checklist: what we have, what to add
+----------------------------------------
+ A) AUTHENTICATION (who is calling?)
+   [HAVE] JWT access tokens that expire in 30 minutes; refresh tokens last 7 days.
+   [HAVE] Passwords hashed (Django PBKDF2); strong-password validators on register.
+   [HAVE] Same generic error for wrong email/password ("Invalid email or password."),
+          so attackers can't discover which emails exist.
+   [HAVE] FastAPI rejects expired, tampered, wrong-type (refresh used as access) tokens.
+   [ADD]  Store tokens in httpOnly + Secure + SameSite cookies instead of localStorage,
+          so JavaScript (and XSS attacks) can't steal them; add CSRF protection then.
+   [ADD]  Refresh-token ROTATION + BLACKLIST (SimpleJWT "token_blacklist" app): each
+          refresh issues a new refresh token and revokes the old one; logout revokes it.
+          A stolen refresh token becomes useless after one use.
+   [ADD]  Asymmetric signing (RS256): only Django holds the PRIVATE key; other
+          services verify with the PUBLIC key, so a compromised shop service can't
+          mint tokens. Publish keys via a JWKS endpoint, rotate them regularly.
+   [ADD]  MFA/OTP for admins and for sensitive actions; email verification on signup.
+
+ B) BRUTE FORCE / CREDENTIAL STUFFING / BOTS
+   [HAVE] Nginx rate limit on login: 30 requests/minute per IP -> 429.
+   [ADD]  Rate limits on ALL APIs: per IP at the gateway AND per user in the app
+          (DRF throttling: AnonRateThrottle / UserRateThrottle; FastAPI: slowapi).
+   [ADD]  Account lockout / progressive delay after N failed logins per ACCOUNT
+          (django-axes), CAPTCHA (reCAPTCHA/hCaptcha/Turnstile) after failures.
+   [ADD]  WAF + bot management at the CDN (Cloudflare/AWS WAF): blocks known bad IPs,
+          SQL-injection patterns, scrapers.
+
+ C) AUTHORIZATION (may this user do THIS?)
+   [HAVE] Object-level checks: orders are filtered by the logged-in user, so another
+          user's order id returns 404 (prevents IDOR, OWASP API #1). Payments are
+          checked against the token's user_id.
+   [HAVE] Admin panel only for is_staff users; status changes only via admin actions.
+   [ADD]  Role/permission model for staff (catalog editor vs order manager).
+
+ D) INPUT VALIDATION ("never trust the client")
+   [HAVE] Validation on the SERVER in both services (DRF serializers, Pydantic):
+          phone/PIN formats, quantity 1-20, positive ids. Frontend validation is
+          only for user experience; hackers skip it with Postman/curl.
+   [HAVE] Server decides prices and totals: Django recalculates from its own DB at
+          order creation, so changing a price in the request has no effect.
+   [HAVE] ORM queries (no string-built SQL), so no SQL injection.
+   [ADD]  Request size limits per endpoint, strict content types, reject unknown fields.
+
+ E) SERVICE-TO-SERVICE TRUST
+   [HAVE] /internal/* blocked at the gateway + shared X-Internal-Key checked with a
+          constant-time comparison.
+   [ADD]  Private network only (no public ports for internal services in production;
+          we expose :8000/:8001 only for local debugging).
+   [ADD]  mTLS between services (service mesh like Istio/Linkerd) or short-lived
+          service tokens (OAuth2 client credentials) instead of one static key.
+
+ F) PAYMENTS AND REPLAY ATTACKS
+   [HAVE] Idempotent payment confirmation (a second confirm does nothing).
+   [ADD]  Idempotency-Key header on checkout/payment (same key = same result, safe retries).
+   [ADD]  Real payment gateway: verify the gateway's webhook SIGNATURE (HMAC) and
+          amount server-side; never trust "payment success" coming from the browser.
+          (Our mock confirm endpoint is for learning only.)
+
+ G) TRANSPORT AND BROWSER HARDENING
+   [ADD]  HTTPS everywhere (TLS at the gateway/CDN), HSTS header.
+   [ADD]  Security headers: Content-Security-Policy, X-Content-Type-Options,
+          X-Frame-Options/frame-ancestors, Referrer-Policy.
+   [ADD]  CORS restricted to our real domains only (no wildcard), DEBUG=0 in production.
+
+ H) SECRETS, DEPENDENCIES, MONITORING
+   [ADD]  Secrets in a secret manager (AWS Secrets Manager / Vault), not in .env;
+          rotate JWT_SECRET / INTERNAL_API_KEY; long random values.
+   [ADD]  Dependency and image scanning in CI (pip-audit, npm audit, Trivy, Dependabot).
+   [ADD]  Audit logs for logins, password changes and admin actions; alerts on
+          spikes of 401/403/429 (signs of an attack). Nginx already adds X-Request-ID.
+   [ADD]  Regular penetration tests against the OWASP API Security Top 10.
+
+4.3 Priority order if we had one sprint
+---------------------------------------
+  1. HTTPS + security headers + DEBUG off + secrets manager      (basics)
+  2. httpOnly cookies + refresh-token rotation/blacklist         (token theft)
+  3. Rate limiting on all APIs + account lockout + CAPTCHA       (brute force / bots)
+  4. Idempotency keys + signed payment webhooks                  (money safety)
+  5. RS256 keys, private network, mTLS for internal calls        (service trust)
+  6. Monitoring, alerts, dependency scanning, pen test           (detect + prevent)
+
+
+==========================================================================================
+SUMMARY
+==========================================================================================
+ - Services talk via the gateway (HTTP), directly (sync REST with an internal key),
+   via Redis events (async), and share identity through JWT. Failures are handled
+   with timeouts, retries, clean 503s, idempotency, health checks and auto-restarts.
+   Next steps: circuit breaker, durable queue + outbox, reconciliation.
+ - 1M users: stateless services scaled horizontally, CDN, caching, DB pooling + read
+   replicas, search engine, durable messaging, observability. Measure first with load tests.
+ - Slow internet: IMPLEMENTED. Detect via the Network Information API or a speed test,
+   then serve no photo / small WebP / HD WebP, with a user override and load-on-demand.
+ - Caching: browser, client cache, service worker, CDN, Next.js ISR/tags, Nginx micro-
+   cache, Redis app cache. Cache what is read often; always re-verify stock and price
+   at checkout.
+ - Security: defence in depth. Authenticate, authorize per object, validate on the
+   server, rate-limit, protect tokens, secure service-to-service calls, sign
+   payments, monitor.
+==========================================================================================

@@ -1,0 +1,406 @@
+==========================================================================================
+        THREADS CLOTH STORE - TEAM DEMO PRESENTATION SCRIPT
+        Microservices e-commerce: Next.js + Django + FastAPI + Redis + Nginx + Docker
+==========================================================================================
+
+Total time : ~35 minutes (25 min talk + live demo, 10 min Q&A)
+Audience   : development team (frontend, backend, QA, leads)
+Goal       : show the working application end to end, explain the architecture,
+             and show how the services communicate.
+
+How to read this script:
+  [SAY]    = talking points (say them in your own words)
+  [DO]     = action to perform on screen
+  [SHOW]   = what the audience should notice
+  [TIP]    = presenter hint
+
+
+==========================================================================================
+PART 0 - PREPARATION (do this 15 minutes BEFORE the meeting)
+==========================================================================================
+
+[ ] 1. Start the stack and wait until healthy
+        cd C:\ecommerce_demo
+        docker compose up -d
+        docker compose ps            -> core_service, shop_service... "(healthy)"
+
+[ ] 2. Reset demo data so stock and carts are clean
+        docker compose exec core_service python manage.py seed_demo --force
+        docker compose exec shop_db psql -U shop -d shop_db -c "TRUNCATE cart_items, carts, payments;"
+
+[ ] 3. Open browser tabs (in this order)
+        Tab 1: http://localhost                        (storefront)
+        Tab 2: http://localhost/admin/                 (Django admin, log in as admin now)
+        Tab 3: http://localhost/api/shop/docs          (FastAPI Swagger docs)
+        Tab 4: http://localhost/api/core/products/     (Django REST browsable API)
+        Use a normal window for the shop and log OUT of the storefront before starting.
+
+[ ] 4. Open TWO terminals side by side, with a large font
+        Terminal A (event logs):
+            docker compose logs -f --since 1s core_worker shop_service
+        Terminal B (commands):
+            cd C:\ecommerce_demo
+
+[ ] 5. Postman: collection "Threads Backend (Local)" imported, environment
+        "Threads - Local (Docker)" selected.
+
+[ ] 6. VS Code open on the project folder (for the short code tour).
+
+[ ] 7. Accounts on a sticky note:
+        Customer : demo@clothstore.com  / demo1234
+        Admin    : admin@clothstore.com / admin1234
+
+[TIP] Run the full demo once alone beforehand. Close Slack/email notifications.
+
+
+==========================================================================================
+PART 1 - INTRODUCTION  (2 min)
+==========================================================================================
+
+[SAY]
+  "Today I'll demo Threads, a clothing store I built to cover the core concepts
+   of modern web development in one project:
+     - a React/Next.js frontend
+     - two backend microservices in Python, Django and FastAPI
+     - communication between services, both synchronous REST and asynchronous events
+     - everything packaged and run with Docker.
+   Everything you'll see runs locally with a single command: docker compose up."
+
+[SAY] Agenda:
+  1. Architecture in one picture
+  2. Live demo: a customer buys a T-shirt
+  3. What happens behind the scenes (logs and events)
+  4. Admin side and the reverse event
+  5. Resilience: what if a service goes down?
+  6. Testing: unit tests + Postman
+  7. Short code tour, trade-offs, Q&A
+
+
+==========================================================================================
+PART 2 - ARCHITECTURE  (4 min)
+==========================================================================================
+
+[DO] Show this diagram (or open BACKEND_DEVELOPER_GUIDE.md section 1)
+
+                               Browser
+                                  |
+                       +----------v-----------+
+                       |  NGINX API GATEWAY   |  http://localhost
+                       +--+--------+-------+--+
+                  /       |        |       |  /api/shop/*
+          +-------v--+ +--v--------v--+  +-v--------------+
+          | Next.js  | | CORE SERVICE |<-| SHOP SERVICE   |
+          | frontend | | Django + DRF | R| FastAPI        |
+          +----------+ | users,catalog| E| cart, checkout,|
+                       | orders,admin | S| payments       |
+                       +--+-------+---+ T+---+--------+---+
+                          |       |  REDIS   |        |
+                          |       +--events--+        |
+                       core_db   core_worker       shop_db
+                     (Postgres)  (listens)        (Postgres)
+
+[SAY] Key points, one per box:
+  - "The browser only talks to ONE address: the Nginx gateway. It routes
+     /api/core to Django, /api/shop to FastAPI, everything else to Next.js."
+  - "The CORE service in Django owns users, the product catalog and orders.
+     It is the source of truth for prices and stock. It also gives us the admin panel."
+  - "The SHOP service in FastAPI owns the cart, checkout and payments."
+  - "Database per service: each service has its own PostgreSQL database.
+     Neither service touches the other's database. They only talk through APIs or events."
+  - "Redis is our message bus for asynchronous events."
+  - "core_worker is the same Django code running as a background listener for events."
+
+[SAY] Two ways the services talk, which is the heart of this project:
+  1. SYNCHRONOUS REST: "FastAPI asks Django 'what's the price and stock of this item?'
+     and WAITS for the answer."
+  2. ASYNCHRONOUS EVENTS: "After payment, FastAPI announces 'payment succeeded'
+     on Redis and DOESN'T wait. Django's worker picks it up and marks the order paid."
+
+[SAY] Login: "Django issues a JWT token. FastAPI verifies the same token with a
+       shared secret, so it never has to call Django to know who the user is."
+
+
+==========================================================================================
+PART 3 - TECH STACK  (1 min)
+==========================================================================================
+
+[SAY] Quick run-through:
+  Frontend : Next.js 15 (App Router), React 19, TypeScript, Tailwind CSS 4,
+             React Hook Form + Zod for forms, Context API for auth/cart state
+  Core     : Python 3.12, Django 5.2, Django REST Framework, SimpleJWT, django-filter
+  Shop     : FastAPI, async SQLAlchemy 2, Alembic migrations, Pydantic, httpx
+  Data     : PostgreSQL 16 (x2), Redis 7 (Pub/Sub)
+  Gateway  : Nginx (routing, rate limiting, blocks internal APIs)
+  Shipping : Docker multi-stage builds + Docker Compose (8 containers)
+  Testing  : pytest (33 tests), Postman collection (61 checks), Newman CLI
+
+
+==========================================================================================
+PART 4 - LIVE DEMO: CUSTOMER JOURNEY  (10 min)
+==========================================================================================
+
+--- 4.1 Browse the store (server-side rendering) -----------------------------------------
+
+[DO]   Tab 1: http://localhost. Scroll the home page.
+[SAY]  "This page is rendered on the server by Next.js. The Next.js server calls the
+        Django catalog API, builds the HTML and sends it ready-made, which is good for
+        speed and SEO."
+
+[DO]   Click "Men", then filter Size "M", then sort "Price: low to high".
+[SHOW] The URL changes: /products?category=men&size=M&ordering=price
+[SAY]  "Filters live in the URL, so they can be bookmarked and shared. The same query
+        string goes straight to Django: /api/core/products/?category=men&size=M..."
+
+[DO]   (Optional) Tab 4: open /api/core/products/?category=men&size=M&ordering=price
+[SHOW] Same data as raw JSON in the DRF browsable API, paginated (count, next, results).
+
+[DO]   Click "Classic Crew Neck Tee". Pick a colour, then show a crossed-out size.
+[SAY]  "Crossed-out sizes are out of stock. Stock is tracked per size and colour,
+        which we call a product variant."
+
+--- 4.2 Protected actions need login (JWT) ------------------------------------------------
+
+[DO]   While logged out, click "Add to cart".
+[SHOW] Message: "Please log in to add items to your cart." with a Log in link.
+[SAY]  "The cart service needs to know who you are, so it requires a token."
+
+[DO]   Click "Log in" and use "Fill demo credentials" (or type demo@clothstore.com / demo1234).
+[SAY]  "Django checks the password and returns two JWT tokens: a short-lived access
+        token (30 min) and a refresh token (7 days). The frontend renews the access
+        token automatically when it expires."
+[TIP]  Optional: browser DevTools > Application > Local Storage, copy access_token,
+       paste it into jwt.io, and show the claims user_id, email, exp.
+
+--- 4.3 Add to cart = SYNCHRONOUS call between services --------------------------------
+
+[DO]   Back on the product page: pick size M, quantity 2, then "Add to cart".
+[SHOW] Cart badge in the navbar updates to 2.
+[DO]   Terminal B:
+          docker compose logs --tail 3 core_service
+[SHOW] A line like:  "GET /internal/variants/2/ HTTP/1.1" 200 ... "python-httpx"
+[SAY]  "That's FastAPI calling Django's INTERNAL API to get the current price and stock
+        before adding to the cart. It's protected by a secret service key, and Nginx
+        blocks /internal/ from the outside world."
+
+[DO]   Try to increase quantity beyond stock (+ button on the cart page, or add again).
+[SHOW] "Only N left in stock" error.
+
+--- 4.4 Checkout + payment = ASYNCHRONOUS event -------------------------------------------
+
+[DO]   Cart, then "Proceed to checkout". Submit the form EMPTY first.
+[SHOW] Validation messages (10-digit mobile, 6-digit PIN), checked on the client with Zod.
+[DO]   Fill the address (e.g. 9876543210 / 411001) and click "Place order".
+[SAY]  "FastAPI now calls Django to create the order. Django re-checks stock with a row
+        lock, so two people can't buy the last item, and uses ITS OWN prices. We never
+        trust prices sent by another service. The order is created as PENDING."
+
+[DO]   Click "Simulate failure".
+[SHOW] Error message; you can retry.  [SAY] "Payment failures are handled gracefully."
+
+[DO]   Make sure Terminal A is visible. Click "Pay now (success)".
+[SHOW] Terminal A prints, within milliseconds:
+          shop_service | Published payment.succeeded ...
+          shop_service | [mock email] To: demo@clothstore.com | Order #... confirmed
+          core_worker  | Handling payment.succeeded {'order_id': ...}
+          core_worker  | Order #... marked PAID and stock reduced
+[SAY]  "FastAPI published an event to Redis and replied to the browser immediately.
+        It didn't wait. Django's worker received the event and marked the order PAID
+        and reduced stock. The confirmation email runs as a FastAPI background task,
+        after the response was sent."
+
+[SHOW] Browser: the order success page shows status PAID, and the cart badge is back to 0.
+[DO]   Go back to the same product: the stock for that size went down by 2.
+
+[DO]   Navbar > "My Orders".
+[SHOW] New order on top, plus 2 older demo orders.
+
+
+==========================================================================================
+PART 5 - ADMIN SIDE + REVERSE EVENT  (3 min)
+==========================================================================================
+
+[DO]   Tab 2: Django admin > Catalog > Products. Open a product.
+[SAY]  "Admins manage products, variants and stock here. We got this from Django
+        for free from the models."
+
+[DO]   Orders > Orders. Tick the order we just paid. Action "Mark selected PAID orders
+       as SHIPPED", then Go.
+[SHOW] Terminal A:
+          shop_service | [mock email] To: demo@clothstore.com | Good news! Order #... has been shipped.
+[SAY]  "This time Django PUBLISHED an 'order.shipped' event and FastAPI CONSUMED it.
+        Events flow in both directions."
+[DO]   Storefront > My Orders, then refresh.  [SHOW] Status SHIPPED.
+
+
+==========================================================================================
+PART 6 - RESILIENCE: WHAT IF A SERVICE GOES DOWN?  (3 min)
+==========================================================================================
+
+[DO]   Open a product page in the storefront first (so it's already loaded).
+[DO]   Terminal B:
+          docker compose stop core_service
+[DO]   Click "Add to cart".
+[TIP]  The button shows "Adding…" for about 10 SECONDS. That's expected: the shop
+       service retries 3 times, and each DNS lookup of the stopped container
+       takes a few seconds to fail. Fill the pause with the talking point below.
+[SHOW] Friendly error: "Catalog service is unavailable. Please try again shortly."
+[SAY]  "FastAPI retries the call with backoff, and every call has a timeout. When
+        Django is still down, it returns a clean 503 with a readable message
+        instead of crashing. Each service fails independently: browsing pages that
+        were already loaded, the gateway and the shop service keep running."
+[DO]   Terminal B:
+          docker compose start core_service
+          docker compose ps          (wait for healthy, ~15 s)
+[DO]   Click "Add to cart" again: it works.
+
+[SAY]  Honest limitation: "Redis Pub/Sub doesn't store messages. If the worker were down
+        at the moment of payment, that order would stay PENDING. In production we would
+        use Redis Streams, RabbitMQ or Kafka with an outbox pattern. This is documented
+        as a known simplification."
+
+
+==========================================================================================
+PART 7 - TESTING  (3 min)
+==========================================================================================
+
+[DO]   Postman: collection "Threads Backend (Local)", then Run collection, then Run.
+[SHOW] 31 requests, 61 checks, all green, in about 5 seconds.
+[SAY]  "The collection tests the whole flow through the gateway: health, auth errors,
+        filters, cart stock limits, checkout validation, failed and successful payment,
+        that the event marks the order PAID, and that internal APIs are blocked
+        without the key. Requests chain values automatically: the token, cart item,
+        order and payment ids."
+
+[DO]   (Optional) Terminal B, the same collection from the command line, ready for CI:
+          npx newman run postman/Threads-Backend.postman_collection.json -e postman/Threads-Local.postman_environment.json
+
+[DO]   (Optional, ~20 s) Terminal B:
+          docker compose run --rm --no-deps -e RUN_MIGRATIONS=0 shop_service pytest
+[SAY]  "Unit tests: 11 in FastAPI with a fake core service, and 22 in Django against a
+        real PostgreSQL test database."
+
+
+==========================================================================================
+PART 8 - CODE TOUR  (4 min, VS Code)
+==========================================================================================
+
+Open each file for ~30 seconds. One sentence each:
+
+  frontend/src/lib/api.ts
+      "One switch: the UI uses mock JSON or the real APIs. Pages never call fetch
+       directly. That's how the UI was built before the backend existed."
+  frontend/src/types/index.ts
+      "The ApiClient interface is the contract both the mock and the HTTP clients follow."
+  core_service/orders/services.py
+      "Business logic: create_order locks rows and uses server prices;
+       mark_order_paid is idempotent, so a duplicate event changes nothing."
+  shop_service/app/services/core_client.py
+      "The HTTP client to Django: timeout, retries, and no retry of POST on timeout,
+       so we never create duplicate orders."
+  shop_service/app/routers/payments.py
+      "Payment confirm: update DB, publish event, background email."
+  core_service/events/handlers.py
+      "Maps event types to handlers. Adding a new event is one dictionary entry."
+  nginx/default.conf
+      "The gateway: routing, login rate limit, /internal/ blocked."
+  docker-compose.yml
+      "8 containers, health checks, startup order, one command to run everything."
+
+
+==========================================================================================
+PART 9 - TRADE-OFFS, LEARNINGS, NEXT STEPS  (2 min)
+==========================================================================================
+
+[SAY] Deliberate simplifications (it's a learning project):
+  - Mock payment instead of Razorpay/Stripe webhooks
+  - Emails are only logged
+  - Pub/Sub can lose events (production: Streams/RabbitMQ + outbox pattern)
+  - Tokens in localStorage (production: httpOnly cookies), DEBUG on, secrets in .env
+
+[SAY] Interesting problems I hit:
+  - Django rejects hostnames with underscores ("core_service"), so I added a
+    "core-service" alias.
+  - Nginx cached container IPs, so rebuilding one service gave 502s. Fixed with
+    Docker DNS re-resolution.
+  - Pages couldn't be pre-rendered at build time because the APIs don't exist during
+    "docker build", so they render per request in real mode.
+
+[SAY] Next steps: CI pipeline (GitHub Actions running pytest + Newman), real product
+      images, frontend tests (Jest/RTL + Playwright), Redis caching for the catalog.
+
+[SAY] "All documentation is in the repo:"
+      BACKEND_DEVELOPER_GUIDE.md, BACKEND_POSTMAN_TESTING_GUIDE.md,
+      FRONTEND_DEVELOPER_GUIDE.md, UI_DEVELOPER_GUIDE.md,
+      JUNIOR_DEVELOPER_ECOMMERCE_FLOW.md
+
+
+==========================================================================================
+PART 10 - Q&A PREPARATION (likely questions and short answers)
+==========================================================================================
+
+Q: Why two backend frameworks instead of one?
+A: To learn both and to show that microservices can use different tech. Django is
+   strong for data-heavy CRUD plus a free admin panel. FastAPI is strong for fast async
+   APIs with automatic docs. In a real company you'd choose per team/use case.
+
+Q: Why does FastAPI call Django instead of reading the product table directly?
+A: Database per service. If the shop read Django's tables, any schema change in
+   Django could silently break the shop. The API is a stable contract.
+
+Q: What if two users buy the last item at the same time?
+A: Django's create_order uses SELECT ... FOR UPDATE inside a transaction. The second
+   checkout waits, then sees stock is too low and gets a 409.
+
+Q: Why not trust the price stored in the cart?
+A: Prices can change, and a client could tamper with it. Django recalculates every
+   line with its own current prices when creating the order.
+
+Q: How does FastAPI know the user without calling Django?
+A: JWT. Django signs the token with JWT_SECRET; FastAPI verifies the signature with
+   the same secret and reads user_id from it. The verification is pure maths, with no network call.
+
+Q: What happens when the access token expires?
+A: The API returns 401. The frontend automatically calls /auth/refresh/ with the
+   refresh token, saves the new access token and retries the request once.
+
+Q: What if the same payment event arrives twice?
+A: mark_order_paid is idempotent. It only acts when the order is still PENDING, so
+   stock is never reduced twice. Confirming an already successful payment also does nothing.
+
+Q: How are internal APIs secured?
+A: Two layers: Nginx returns 404 for /internal/ from outside, and Django requires a
+   shared X-Internal-Key header (compared in constant time).
+
+Q: How would this run in production?
+A: Same images. Push to a registry, run on Kubernetes/ECS, managed Postgres/Redis,
+   HTTPS at the gateway/load balancer, secrets in a secret manager, DEBUG off.
+
+Q: How long does it take to start?
+A: First build ~10 min (downloads). After that, "docker compose up -d" takes ~30-60 s.
+
+Q: How did you build the UI before the backend existed?
+A: A mock API with the same interface as the real one, using JSON files with the same
+   shapes as the planned APIs. When the backend was ready, one env variable switched
+   it over and no page code changed. The same JSON files are now the backend's seed data.
+
+
+==========================================================================================
+BACKUP PLAN (if something breaks during the live demo)
+==========================================================================================
+
+- Page shows an error / 502       -> docker compose ps, wait for "(healthy)", refresh
+- Login fails with 429            -> rate limit; wait 60 s (or use the other account)
+- "Only N left in stock"          -> pick another size, or reset:
+                                     docker compose exec core_service python manage.py seed_demo --force
+- Order stays PENDING             -> docker compose restart core_worker, then place a new order
+- Everything is broken            -> docker compose down && docker compose up -d
+                                     (data is kept; add -v only to wipe everything)
+- No internet / Docker issue      -> run the Postman collection results / Newman output
+                                     you saved earlier, and walk through the diagrams instead
+
+[TIP] Before the meeting, save a Newman run to a file as evidence:
+      npx newman run postman/Threads-Backend.postman_collection.json -e postman/Threads-Local.postman_environment.json > newman-result.txt
+
+==========================================================================================
+END OF SCRIPT - "Thank you! Questions?"
+==========================================================================================
