@@ -219,6 +219,7 @@ Or import the two files from `postman/` into Postman and use **Run collection**
 | [JUNIOR_DEVELOPER_ECOMMERCE_FLOW.md](JUNIOR_DEVELOPER_ECOMMERCE_FLOW.md) | End-to-end walkthrough of every user journey, with exercises |
 | [ARCHITECTURE_QA.txt](ARCHITECTURE_QA.txt) | Failure handling, scaling to 1M users, caching, API security |
 | [DEMO_PRESENTATION_SCRIPT.txt](DEMO_PRESENTATION_SCRIPT.txt) | Script for presenting the project to a team |
+| [INTERVIEW_QUESTIONS_AND_ANSWERS.md](INTERVIEW_QUESTIONS_AND_ANSWERS.md) | 125 interview questions & answers based on this project |
 | [ecommerce_cloth_store_plan.txt](ecommerce_cloth_store_plan.txt) | The original development plan |
 
 ---
