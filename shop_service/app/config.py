@@ -11,7 +11,7 @@ class Settings(BaseSettings):
     shop_db_url: str = "postgresql+psycopg://shop:shop@shop_db:5432/shop_db"
 
     # Must be the SAME secret Django uses to sign JWTs
-    jwt_secret: str = "change-me-dev-only"
+    jwt_secret: str = "dev-only-jwt-secret-change-me-0123456789abcdef"
     jwt_algorithm: str = "HS256"
 
     # Synchronous REST calls to the core (Django) service

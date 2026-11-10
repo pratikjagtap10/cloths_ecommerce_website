@@ -150,7 +150,7 @@ SIMPLE_JWT = {
     "ACCESS_TOKEN_LIFETIME": timedelta(minutes=int(env("JWT_ACCESS_MINUTES", "30"))),
     "REFRESH_TOKEN_LIFETIME": timedelta(days=int(env("JWT_REFRESH_DAYS", "7"))),
     "ALGORITHM": "HS256",
-    "SIGNING_KEY": env("JWT_SECRET", "change-me-dev-only"),
+    "SIGNING_KEY": env("JWT_SECRET", "dev-only-jwt-secret-change-me-0123456789abcdef"),
     "AUTH_HEADER_TYPES": ("Bearer",),
     "USER_ID_FIELD": "id",
     "USER_ID_CLAIM": "user_id",
