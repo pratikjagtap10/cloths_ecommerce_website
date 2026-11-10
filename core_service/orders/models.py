@@ -29,6 +29,10 @@ class Order(models.Model):
     created_at = models.DateTimeField(default=timezone.now)
     updated_at = models.DateTimeField(auto_now=True)
 
+    # Set by the shop service from the client's Idempotency-Key. Unique, so the
+    # same checkout can never create two orders, even if the request is retried.
+    idempotency_key = models.CharField(max_length=150, unique=True, null=True, blank=True, editable=False)
+
     class Meta:
         ordering = ["-created_at", "-id"]
 

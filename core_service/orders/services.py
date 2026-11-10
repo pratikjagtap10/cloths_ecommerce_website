@@ -5,7 +5,7 @@ the event consumer, the admin and tests.
 import logging
 
 from django.conf import settings
-from django.db import transaction
+from django.db import IntegrityError, transaction
 from django.db.models import F
 from django.db.models.functions import Greatest
 from rest_framework import status
@@ -28,8 +28,34 @@ def shipping_for(subtotal: int) -> int:
     return 0 if subtotal == 0 or subtotal >= settings.FREE_SHIPPING_OVER else settings.SHIPPING_FEE
 
 
+class IdempotencyKeyConflict(APIException):
+    status_code = status.HTTP_409_CONFLICT
+    default_detail = "This idempotency key was already used by another user."
+    default_code = "idempotency_conflict"
+
+
+def create_order_idempotent(user, address: dict, lines: list[dict], idempotency_key: str) -> tuple[Order, bool]:
+    """Create the order once per idempotency key.
+
+    Returns (order, created). If an order with this key already exists (a retried
+    request, e.g. the first response was lost on a slow network), that order is
+    returned unchanged instead of creating a duplicate.
+    """
+    existing = Order.objects.filter(idempotency_key=idempotency_key).first()
+    if existing is None:
+        try:
+            return create_order(user, address, lines, idempotency_key=idempotency_key), True
+        except IntegrityError:
+            # Two identical requests raced; the unique constraint let only one win
+            existing = Order.objects.get(idempotency_key=idempotency_key)
+    if existing.user_id != user.id:
+        raise IdempotencyKeyConflict()
+    logger.info("Idempotent replay: returning existing order #%s for key %s", existing.id, idempotency_key)
+    return existing, False
+
+
 @transaction.atomic
-def create_order(user, address: dict, lines: list[dict]) -> Order:
+def create_order(user, address: dict, lines: list[dict], idempotency_key: str | None = None) -> Order:
     """Create a PENDING order. This service is the source of truth, so it re-checks
     stock and uses ITS OWN prices (never trusts prices sent by another service)."""
     variant_ids = [line["variant_id"] for line in lines]
@@ -57,7 +83,12 @@ def create_order(user, address: dict, lines: list[dict]) -> Order:
     subtotal = sum(v.price * qty for v, qty in resolved)
     shipping_fee = shipping_for(subtotal)
     order = Order.objects.create(
-        user=user, subtotal=subtotal, shipping_fee=shipping_fee, total=subtotal + shipping_fee, **address
+        user=user,
+        subtotal=subtotal,
+        shipping_fee=shipping_fee,
+        total=subtotal + shipping_fee,
+        idempotency_key=idempotency_key,
+        **address,
     )
     OrderItem.objects.bulk_create(
         OrderItem(

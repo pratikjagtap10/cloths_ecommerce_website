@@ -79,10 +79,14 @@ class CoreClient:
     async def create_order(self, payload: dict) -> dict:
         """POST /internal/orders/ -> the created order.
 
-        Timeouts are NOT retried here: the first request may have created the order
-        already, and retrying could create a duplicate."""
-        response = await self._request("POST", "/internal/orders/", json=payload, retry_on_timeout=False)
-        if response.status_code == 201:
+        Without an idempotency_key, timeouts are NOT retried: the first request may
+        have created the order already, and retrying could create a duplicate.
+        WITH a key, retrying is safe: the core service returns the same order."""
+        response = await self._request(
+            "POST", "/internal/orders/", json=payload, retry_on_timeout=bool(payload.get("idempotency_key"))
+        )
+        # 201 = created, 200 = same idempotency_key seen before: the existing order
+        if response.status_code in (200, 201):
             return response.json()
         if response.status_code in (400, 404, 409):
             raise CoreServiceError(response.status_code, _detail(response))

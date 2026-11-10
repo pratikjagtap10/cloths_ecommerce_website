@@ -21,7 +21,9 @@ class OrderAdmin(admin.ModelAdmin):
     date_hierarchy = "created_at"
     inlines = [OrderItemInline]
     # Status changes go through the actions below so events are always published
-    readonly_fields = ["user", "status", "subtotal", "shipping_fee", "total", "created_at", "updated_at"]
+    readonly_fields = [
+        "user", "status", "subtotal", "shipping_fee", "total", "idempotency_key", "created_at", "updated_at",
+    ]
     actions = ["mark_shipped", "mark_cancelled"]
 
     @admin.action(description="Mark selected PAID orders as SHIPPED (publishes order.shipped)")

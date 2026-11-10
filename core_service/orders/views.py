@@ -8,7 +8,7 @@ from users.models import User
 
 from .models import Order
 from .serializers import InternalOrderCreateSerializer, OrderSerializer
-from .services import create_order
+from .services import create_order, create_order_idempotent
 
 
 class OrderViewSet(viewsets.ReadOnlyModelViewSet):
@@ -32,7 +32,11 @@ class OrderViewSet(viewsets.ReadOnlyModelViewSet):
 class InternalOrderCreateView(generics.GenericAPIView):
     """POST /internal/orders/  (shop service only, needs X-Internal-Key)
 
-    Body: {"user_id": 1, "address": {...}, "items": [{"variant_id": 2, "quantity": 1}]}
+    Body: {"user_id": 1, "address": {...}, "items": [{"variant_id": 2, "quantity": 1}],
+           "idempotency_key": "optional-unique-key"}
+
+    With an idempotency_key, a repeated request returns the ORIGINAL order with
+    200 (instead of 201) and the header "Idempotent-Replayed: true".
     """
 
     serializer_class = InternalOrderCreateSerializer
@@ -44,5 +48,15 @@ class InternalOrderCreateView(generics.GenericAPIView):
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
         user = get_object_or_404(User, pk=data["user_id"], is_active=True)
-        order = create_order(user, dict(data["address"]), [dict(line) for line in data["items"]])
-        return Response(OrderSerializer(order).data, status=status.HTTP_201_CREATED)
+        address = dict(data["address"])
+        lines = [dict(line) for line in data["items"]]
+
+        key = data.get("idempotency_key")
+        if not key:
+            order = create_order(user, address, lines)
+            return Response(OrderSerializer(order).data, status=status.HTTP_201_CREATED)
+
+        order, created = create_order_idempotent(user, address, lines, key)
+        if created:
+            return Response(OrderSerializer(order).data, status=status.HTTP_201_CREATED)
+        return Response(OrderSerializer(order).data, status=status.HTTP_200_OK, headers={"Idempotent-Replayed": "true"})

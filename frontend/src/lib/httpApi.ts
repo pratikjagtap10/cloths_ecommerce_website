@@ -49,7 +49,8 @@ async function request<T>(path: string, init: RequestInit = {}, retry = true): P
     } catch {
       /* non-JSON error body */
     }
-    throw new ApiError(res.status, message);
+    const retryAfter = Number(res.headers.get("Retry-After")) || undefined;
+    throw new ApiError(res.status, message, retryAfter);
   }
   return res.status === 204 ? (undefined as T) : ((await res.json()) as T);
 }
@@ -86,7 +87,12 @@ export const httpApi: ApiClient = {
   updateCartItem: (id, quantity) =>
     request(`/shop/cart/items/${id}/`, { method: "PATCH", body: json({ quantity }) }),
   removeCartItem: (id) => request(`/shop/cart/items/${id}/`, { method: "DELETE" }),
-  checkout: (address) => request("/shop/checkout/", { method: "POST", body: json({ address }) }),
+  checkout: (address, idempotencyKey) =>
+    request("/shop/checkout/", {
+      method: "POST",
+      body: json({ address }),
+      headers: idempotencyKey ? { "Idempotency-Key": idempotencyKey } : {},
+    }),
   confirmPayment: (id, success) =>
     request(`/shop/payments/${id}/confirm/`, { method: "POST", body: json({ success }) }),
   getOrders: () => request("/core/orders/"),

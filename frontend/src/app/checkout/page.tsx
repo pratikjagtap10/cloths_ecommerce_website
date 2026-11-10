@@ -10,8 +10,9 @@ import { zodResolver } from "@hookform/resolvers/zod";
 import { z } from "zod";
 import { useAuth } from "@/context/AuthContext";
 import { useCart } from "@/context/CartContext";
-import { api, errorMessage } from "@/lib/api";
+import { api, ApiError, errorMessage } from "@/lib/api";
 import { formatPrice, shippingFor } from "@/lib/format";
+import { clearCheckoutKey, getCheckoutKey } from "@/lib/idempotency";
 import type { CheckoutResult } from "@/types";
 
 const addressSchema = z.object({
@@ -53,12 +54,42 @@ export default function CheckoutPage() {
     resetOptions: { keepDirtyValues: true },
   });
 
+  const userKey = user?.id ?? "guest";
+
   const placeOrder = async (address: AddressForm) => {
     setError(null);
-    try {
-      setResult(await api.checkout(address));
-    } catch (e) {
-      setError(errorMessage(e));
+    // Same cart + same address = same checkout = same Idempotency-Key. A retry
+    // (slow network, refresh, second tab) then returns the ORIGINAL order and
+    // payment instead of creating duplicates.
+    const fingerprint = JSON.stringify({
+      items: cart.items.map((i) => [i.variant_id, i.quantity]).sort(),
+      address: JSON.stringify(address, Object.keys(address).sort()),
+    });
+    const idempotencyKey = getCheckoutKey(userKey, fingerprint);
+
+    for (let attempt = 1; ; attempt++) {
+      try {
+        const res = await api.checkout(address, idempotencyKey);
+        if (res.payment.status === "SUCCESS") {
+          // This checkout was already paid (e.g. in another tab): don't pay again
+          clearCheckoutKey(userKey);
+          await refresh();
+          router.push(`/orders/${res.order.id}?placed=1`);
+          return;
+        }
+        setResult(res);
+        return;
+      } catch (e) {
+        // 409 + Retry-After: the first request is still running on the server.
+        // Wait and ask again with the SAME key; we'll get its result.
+        if (e instanceof ApiError && e.status === 409 && e.retryAfter && attempt < 5) {
+          setError("Your order is still being processed, please wait…");
+          await new Promise((r) => setTimeout(r, e.retryAfter! * 1000));
+          continue;
+        }
+        setError(errorMessage(e));
+        return;
+      }
     }
   };
 
@@ -67,8 +98,10 @@ export default function CheckoutPage() {
     setPaying(true);
     setError(null);
     try {
+      // Safe to retry: confirming a payment that already succeeded just returns it
       const payment = await api.confirmPayment(result.payment.id, success);
       if (payment.status === "SUCCESS") {
+        clearCheckoutKey(userKey); // checkout finished: the next one gets a new key
         await refresh(); // the cart was cleared by the "payment.succeeded" flow
         router.push(`/orders/${result.order.id}?placed=1`);
       } else {

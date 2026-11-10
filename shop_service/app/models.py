@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import DateTime, ForeignKey, Integer, String, UniqueConstraint, func
+from sqlalchemy import JSON, DateTime, ForeignKey, Integer, String, UniqueConstraint, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .database import Base
@@ -53,3 +53,24 @@ class Payment(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
+
+
+class IdempotencyRecord(Base):
+    """Remembers checkout requests by their Idempotency-Key header.
+
+    Lifecycle:  IN_PROGRESS (key claimed, request running)
+             -> COMPLETED   (order + payment created; repeats get the same result)
+    The row is deleted if the request fails, so the client can retry with the same key.
+    """
+
+    __tablename__ = "idempotency_records"
+    __table_args__ = (UniqueConstraint("user_id", "key", name="uq_idempotency_user_key"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(Integer)
+    key: Mapped[str] = mapped_column(String(100))
+    request_hash: Mapped[str] = mapped_column(String(64))  # SHA-256 of the request body
+    status: Mapped[str] = mapped_column(String(12), default="IN_PROGRESS")  # IN_PROGRESS | COMPLETED
+    order_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    payment_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

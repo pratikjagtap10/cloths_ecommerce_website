@@ -46,3 +46,7 @@ class InternalOrderCreateSerializer(serializers.Serializer):
     user_id = serializers.IntegerField(min_value=1)
     address = AddressSerializer()
     items = OrderLineInputSerializer(many=True, allow_empty=False)
+    idempotency_key = serializers.RegexField(
+        r"^[A-Za-z0-9:_\-]{8,150}$", required=False, allow_null=True,
+        error_messages={"invalid": "Idempotency key must be 8-150 letters, digits, ':', '_' or '-'."},
+    )

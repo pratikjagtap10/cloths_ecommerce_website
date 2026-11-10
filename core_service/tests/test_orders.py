@@ -65,6 +65,43 @@ def test_invalid_address_returns_readable_detail(internal_client, catalog, user,
     assert "PIN code must be 6 digits." in res.data["detail"]
 
 
+# ---------- idempotency ----------
+def test_same_idempotency_key_returns_same_order(internal_client, catalog, user, address):
+    payload = {
+        "user_id": user.id,
+        "address": address,
+        "items": [{"variant_id": catalog["tee_m"].id, "quantity": 1}],
+        "idempotency_key": "shop:1:retry-test-key",
+    }
+    first = internal_client.post("/internal/orders/", payload, format="json")
+    second = internal_client.post("/internal/orders/", payload, format="json")
+
+    assert first.status_code == 201
+    assert second.status_code == 200
+    assert second["Idempotent-Replayed"] == "true"
+    assert second.data["id"] == first.data["id"]
+    assert Order.objects.filter(user=user).count() == 1
+
+
+def test_idempotency_key_of_another_user_is_rejected(internal_client, catalog, user, address):
+    other = User.objects.create_user(email="other@example.com", password="x-Strong-pass-1")
+    payload = {
+        "address": address,
+        "items": [{"variant_id": catalog["tee_m"].id, "quantity": 1}],
+        "idempotency_key": "shared-key-123",
+    }
+    assert internal_client.post("/internal/orders/", {**payload, "user_id": user.id}, format="json").status_code == 201
+    res = internal_client.post("/internal/orders/", {**payload, "user_id": other.id}, format="json")
+    assert res.status_code == 409
+
+
+def test_without_key_each_request_creates_an_order(internal_client, catalog, user, address):
+    payload = {"user_id": user.id, "address": address, "items": [{"variant_id": catalog["tee_m"].id, "quantity": 1}]}
+    internal_client.post("/internal/orders/", payload, format="json")
+    internal_client.post("/internal/orders/", payload, format="json")
+    assert Order.objects.filter(user=user).count() == 2
+
+
 # ---------- public orders API ----------
 def test_user_sees_only_own_orders(auth_client, catalog, user, address):
     mine = create_order(user, address, [{"variant_id": catalog["tee_m"].id, "quantity": 1}])

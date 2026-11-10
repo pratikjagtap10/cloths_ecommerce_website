@@ -22,6 +22,7 @@ const K = {
   cart: "mock_cart",
   orders: "mock_orders",
   payments: "mock_payments",
+  idempotency: "mock_idempotency",
 };
 
 /** Fake network latency so loading states are visible */
@@ -29,7 +30,12 @@ const delay = (ms = 250) => new Promise((r) => setTimeout(r, ms));
 
 /** Error carrying an HTTP-like status, same as the HTTP client throws */
 export class ApiError extends Error {
-  constructor(public status: number, message: string) {
+  constructor(
+    public status: number,
+    message: string,
+    /** Seconds from the Retry-After header: set when retrying the SAME request is safe */
+    public retryAfter?: number,
+  ) {
     super(message);
   }
 }
@@ -202,9 +208,26 @@ export const mockApi: ApiClient = {
     return saveCart(readCart().filter((i) => i.id !== itemId));
   },
 
-  async checkout(address: Address): Promise<CheckoutResult> {
+  async checkout(address: Address, idempotencyKey?: string): Promise<CheckoutResult> {
     await delay(500);
     const userId = currentUserId();
+
+    // Same Idempotency-Key behaviour as the real shop service
+    const idemKey = idempotencyKey ? `${userId}:${idempotencyKey}` : null;
+    const records = readJSON<Record<string, { address: string; orderId: number; paymentId: number }>>(
+      K.idempotency,
+      {},
+    );
+    if (idemKey && records[idemKey]) {
+      const rec = records[idemKey];
+      if (rec.address !== JSON.stringify(address)) {
+        throw new ApiError(422, "This Idempotency-Key was already used for a different checkout request.");
+      }
+      const order = allOrders().find((o) => o.id === rec.orderId);
+      const payment = readJSON<Payment[]>(K.payments, []).find((p) => p.id === rec.paymentId);
+      if (order && payment) return { order, payment };
+    }
+
     const items = readCart();
     if (items.length === 0) throw new ApiError(400, "Your cart is empty.");
 
@@ -240,6 +263,12 @@ export const mockApi: ApiClient = {
 
     writeJSON(K.orders, [...localOrders(), order]);
     writeJSON(K.payments, [...readJSON<Payment[]>(K.payments, []), payment]);
+    if (idemKey) {
+      writeJSON(K.idempotency, {
+        ...records,
+        [idemKey]: { address: JSON.stringify(address), orderId: order.id, paymentId: payment.id },
+      });
+    }
     return { order, payment };
   },
 

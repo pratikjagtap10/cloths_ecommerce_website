@@ -14,8 +14,13 @@ from ..services.notifications import send_order_confirmation
 router = APIRouter(prefix="/api/shop/payments", tags=["payments"])
 
 
-async def _get_own_payment(db: AsyncSession, payment_id: int, user: CurrentUser) -> Payment:
-    payment = await db.get(Payment, payment_id)
+async def _get_own_payment(db: AsyncSession, payment_id: int, user: CurrentUser, lock: bool = False) -> Payment:
+    query = select(Payment).where(Payment.id == payment_id)
+    if lock:
+        # SELECT ... FOR UPDATE: if two "Pay" requests arrive together, the second
+        # waits for the first to commit and then sees status SUCCESS (no double charge)
+        query = query.with_for_update()
+    payment = await db.scalar(query)
     if payment is None or payment.user_id != user.id:
         raise HTTPException(404, "Payment not found.")
     return payment
@@ -43,8 +48,9 @@ async def confirm_payment(
                        confirmation email sent in the background
       success=false -> payment FAILED (the user can try again)
     """
-    payment = await _get_own_payment(db, payment_id, user)
+    payment = await _get_own_payment(db, payment_id, user, lock=True)
     if payment.status == "SUCCESS":
+        await db.commit()  # end the transaction to release the row lock
         return payment  # idempotent: paying twice does nothing
 
     if not body.success:

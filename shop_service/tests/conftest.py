@@ -31,7 +31,9 @@ class FakeCore:
 
     def __init__(self):
         self.down = False
-        self.orders = []
+        self.orders = []          # every create_order payload received
+        self.by_key = {}          # idempotency_key -> order (like the real core service)
+        self.next_id = 1003
 
     async def get_variant(self, variant_id):
         if self.down:
@@ -41,10 +43,19 @@ class FakeCore:
         return VARIANTS[variant_id]
 
     async def create_order(self, payload):
+        if self.down:
+            raise CoreServiceError(503, "Catalog service is unavailable. Please try again shortly.")
         self.orders.append(payload)
+        key = payload.get("idempotency_key")
+        if key and key in self.by_key:
+            return self.by_key[key]
         subtotal = sum(VARIANTS[i["variant_id"]]["price"] * i["quantity"] for i in payload["items"])
-        return {"id": 1003, "user_id": payload["user_id"], "status": "PENDING", "subtotal": subtotal,
-                "shipping_fee": 0, "total": subtotal, "address": payload["address"], "items": []}
+        order = {"id": self.next_id, "user_id": payload["user_id"], "status": "PENDING", "subtotal": subtotal,
+                 "shipping_fee": 0, "total": subtotal, "address": payload["address"], "items": []}
+        self.next_id += 1
+        if key:
+            self.by_key[key] = order
+        return order
 
 
 @pytest.fixture

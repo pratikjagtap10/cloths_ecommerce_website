@@ -104,3 +104,90 @@ def test_cannot_confirm_someone_elses_payment(client, auth, published):
     payment_id = client.post("/api/shop/checkout/", json={"address": ADDRESS}, headers=auth).json()["payment"]["id"]
     other = {"Authorization": f"Bearer {make_token(user_id=2)}"}
     assert client.post(f"/api/shop/payments/{payment_id}/confirm/", json={}, headers=other).status_code == 404
+
+
+# ---------- idempotency (Idempotency-Key header on checkout) ----------
+def _checkout(client, auth, key=None, address=ADDRESS):
+    headers = {**auth, **({"Idempotency-Key": key} if key else {})}
+    return client.post("/api/shop/checkout/", json={"address": address}, headers=headers)
+
+
+def test_same_key_returns_same_order_and_payment(client, auth, fake_core):
+    client.post("/api/shop/cart/items/", json={"variant_id": 1}, headers=auth)
+
+    first = _checkout(client, auth, "checkout-key-0001")
+    second = _checkout(client, auth, "checkout-key-0001")  # e.g. user retried on a slow network
+
+    assert first.status_code == second.status_code == 201
+    assert second.headers.get("Idempotent-Replayed") == "true"
+    assert second.json()["order"]["id"] == first.json()["order"]["id"]
+    assert second.json()["payment"]["id"] == first.json()["payment"]["id"]
+    assert len(fake_core.orders) == 1  # the core service was called only once
+
+
+def test_without_key_each_checkout_creates_a_new_order(client, auth, fake_core):
+    client.post("/api/shop/cart/items/", json={"variant_id": 1}, headers=auth)
+    a = _checkout(client, auth).json()
+    b = _checkout(client, auth).json()
+    assert a["order"]["id"] != b["order"]["id"]
+
+
+def test_key_reused_with_different_body_is_rejected(client, auth):
+    client.post("/api/shop/cart/items/", json={"variant_id": 1}, headers=auth)
+    _checkout(client, auth, "checkout-key-0002")
+    res = _checkout(client, auth, "checkout-key-0002", address={**ADDRESS, "city": "Mumbai"})
+    assert res.status_code == 422
+    assert "different checkout request" in res.json()["detail"]
+
+
+def test_replay_after_payment_returns_current_payment_status(client, auth, published):
+    client.post("/api/shop/cart/items/", json={"variant_id": 1}, headers=auth)
+    first = _checkout(client, auth, "checkout-key-0003").json()
+    client.post(f"/api/shop/payments/{first['payment']['id']}/confirm/", json={"success": True}, headers=auth)
+
+    # Payment done and cart cleared; the user now resubmits the old checkout
+    replay = _checkout(client, auth, "checkout-key-0003")
+    assert replay.status_code == 201
+    assert replay.json()["payment"]["status"] == "SUCCESS"  # not a new PENDING payment
+    assert len(published) == 1
+
+
+def test_request_in_progress_returns_409(client, auth):
+    import asyncio
+
+    from app.database import get_db
+    from app.main import app
+    from app.models import IdempotencyRecord
+    from app.services.idempotency import request_hash
+
+    async def insert_in_progress():
+        override = app.dependency_overrides[get_db]
+        async for session in override():
+            session.add(IdempotencyRecord(user_id=1, key="checkout-key-0004",
+                                          request_hash=request_hash({"address": ADDRESS}), status="IN_PROGRESS"))
+            await session.commit()
+
+    asyncio.run(insert_in_progress())
+    client.post("/api/shop/cart/items/", json={"variant_id": 1}, headers=auth)
+    res = _checkout(client, auth, "checkout-key-0004")
+    assert res.status_code == 409
+    assert "already being processed" in res.json()["detail"]
+    assert res.headers["Retry-After"] == "2"
+
+
+def test_failed_checkout_releases_key_for_retry(client, auth, fake_core):
+    client.post("/api/shop/cart/items/", json={"variant_id": 1}, headers=auth)
+    fake_core.down = True
+    assert _checkout(client, auth, "checkout-key-0005").status_code == 503
+
+    fake_core.down = False  # network is back: the SAME key can be retried
+    res = _checkout(client, auth, "checkout-key-0005")
+    assert res.status_code == 201
+    assert "Idempotent-Replayed" not in res.headers
+
+
+def test_core_receives_scoped_key_and_invalid_keys_are_rejected(client, auth, fake_core):
+    client.post("/api/shop/cart/items/", json={"variant_id": 1}, headers=auth)
+    assert _checkout(client, auth, "bad key!").status_code == 400
+    _checkout(client, auth, "checkout-key-0006")
+    assert fake_core.orders[-1]["idempotency_key"] == "shop-1-checkout-key-0006"
