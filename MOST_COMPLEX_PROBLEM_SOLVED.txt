@@ -1,0 +1,189 @@
+INTERVIEW QUESTION: "What was the most complex problem you solved?"
+==================================================================
+
+Format: STAR (Situation, Task, Action, Result)
+Speaking time: about 2-3 minutes. A 30-second version is at the end.
+
+
+------------------------------------------------------------------
+SHORT ANSWER (opening line)
+------------------------------------------------------------------
+"The most complex problem I solved was preventing duplicate orders and
+double payments at checkout in a microservice-based e-commerce application
+(Next.js frontend, Django core service, FastAPI shop service, Redis events).
+It was hard because the problem was spread across three services, two
+databases and an unreliable network, so no single 'if' check could fix it."
+
+
+------------------------------------------------------------------
+S - SITUATION
+------------------------------------------------------------------
+- I built a clothing e-commerce app called "Threads" using a microservice
+  architecture:
+    * Next.js / React frontend
+    * Django core service: users, catalog, orders (its own PostgreSQL DB)
+    * FastAPI shop service: cart, checkout, payments (its own PostgreSQL DB)
+    * Redis Pub/Sub for events, Nginx as the API gateway, all in Docker
+- Checkout crosses services: the FastAPI service asks Django to create the
+  order, then creates a payment. After payment, it publishes a
+  "payment.succeeded" event, and a Django worker marks the order PAID and
+  reduces the stock.
+- The risk: on a slow network, the user clicks "Place order" twice,
+  refreshes the page, or has two tabs open. The first request may have
+  already succeeded on the server, but the response was lost. The retry
+  then creates a SECOND order, and possibly a second payment.
+
+
+------------------------------------------------------------------
+T - TASK
+------------------------------------------------------------------
+Make checkout and payment "exactly once" from the user's point of view:
+- Any number of retries of the same checkout must create only ONE order and
+  ONE payment.
+- Paying twice must charge once and reduce stock once.
+- It must work for requests that arrive AT THE SAME TIME, not only one
+  after another.
+- Old clients (Postman collection, requests without a key) must keep
+  working.
+
+
+------------------------------------------------------------------
+A - ACTION (what I did)
+------------------------------------------------------------------
+1. Idempotency-Key pattern (as used by Stripe), end to end
+   - Frontend: generate one key per checkout attempt. The key is reused
+     while the cart and address stay the same (based on a "fingerprint" of
+     cart + address). It is stored in localStorage, so all tabs share it,
+     and cleared after a successful payment.
+   - Header "Idempotency-Key" is sent to the FastAPI checkout API.
+
+2. Server side, FastAPI shop service
+   - A new "idempotency_records" table with a UNIQUE (user_id, key)
+     constraint and a status: IN_PROGRESS -> COMPLETED.
+   - First request: inserts the row (it "claims" the key) and places the
+     order.
+   - Same key, already COMPLETED: return the SAME stored order and the
+     payment's current status (header "Idempotent-Replayed: true").
+   - Same key, still IN_PROGRESS (a parallel request): return 409 with
+     "Retry-After: 2". The frontend waits and retries with the same key.
+   - Same key, but a different cart or address: return 422 (the key is
+     misused).
+   - If the work fails, the claim is released so the user can try again.
+     Stale claims are taken over after 60 seconds.
+   - The payment and the COMPLETED record are saved in ONE database commit
+     (Unit of Work), so they can never get out of sync.
+
+3. Between the services (FastAPI -> Django)
+   - The response between the two services can also be lost, so Django
+     gets its own key (shop-<user>-<key>) stored on Order.idempotency_key
+     with a UNIQUE constraint.
+   - If two inserts race, the database rejects one (IntegrityError). I
+     catch it and return the existing order (200 + replay header instead of
+     201).
+   - Because the call is now idempotent, I made the HTTP client retry
+     timeouts ONLY when a key is present. Without a key, a retry could
+     create a duplicate, so it is not retried.
+
+4. Payment confirmation
+   - SELECT ... FOR UPDATE on the payment row, so a double "Pay" click
+     waits for the first one and then sees SUCCESS. No double charge and
+     only one event.
+   - The Django event handler (mark_order_paid) is idempotent too: if the
+     order is not PENDING anymore, it does nothing. Stock is reduced only
+     once.
+   - Bug I found while doing this: rolling back after the locked read
+     expired the payment object in async SQLAlchemy and broke the
+     response. I fixed it by committing instead, which also releases the
+     lock.
+
+5. Testing (to prove it, not just believe it)
+   - Unit and API tests: Django 25/25 and FastAPI 18/18 passing, including
+     new idempotency tests (replay, 409 + Retry-After, 422 on a different
+     body, another user's key rejected).
+   - End-to-end test through the Nginx gateway with real PostgreSQL and
+     Redis:
+       * 6 CONCURRENT checkouts with one key -> exactly 1 order
+       * 6 CONCURRENT "Pay" requests -> 1 payment.succeeded event, and
+         stock reduced once (not 6 times)
+       * a request without a key still works
+   - Postman regression: 57/57 assertions passing.
+   - I ran everything in a separate, temporary Docker Compose stack so it
+     didn't disturb other running environments.
+
+
+------------------------------------------------------------------
+R - RESULT
+------------------------------------------------------------------
+- Duplicate orders and double charges are impossible, even with slow
+  networks, double clicks, refreshes, multiple tabs and lost responses
+  between services.
+- Fully backward compatible: requests without a key behave as before.
+- The user sees a friendly "Your order is still being processed..."
+  message instead of an error or a duplicate order.
+- Clean, documented commits, and the design is described in
+  DESIGN_PATTERNS.md.
+
+
+------------------------------------------------------------------
+WHAT MADE IT COMPLEX (say this if they ask "why was it hard?")
+------------------------------------------------------------------
+1. Distributed problem: 3 services, 2 databases. There is no single
+   transaction across them, so each hop had to be made idempotent on its
+   own.
+2. Concurrency: an "if order exists" check is not enough, because two
+   requests can pass the check at the same time. I relied on database
+   UNIQUE constraints and row locks as the final referee.
+3. A lost response is not a failure: the server did the work, but the
+   client doesn't know. The retry has to return the SAME result, not
+   repeat the work.
+4. Retries are dangerous unless the operation is idempotent. I changed
+   the retry policy based on whether a key is present.
+
+
+------------------------------------------------------------------
+LESSONS LEARNED
+------------------------------------------------------------------
+- In distributed systems, design every write so it is safe to repeat.
+- Let the database enforce uniqueness; application checks have race
+  windows.
+- Test concurrency with real parallel requests, not only sequential tests.
+- Next step I would add in production: the Transactional Outbox pattern,
+  so the "payment.succeeded" event is never lost even if Redis is down
+  at that moment.
+
+
+------------------------------------------------------------------
+30-SECOND VERSION
+------------------------------------------------------------------
+"In my microservice e-commerce project, slow networks and double clicks
+could create duplicate orders, because checkout goes through FastAPI and
+Django with separate databases. I implemented the Idempotency-Key pattern
+end to end. The frontend reuses one key per checkout. FastAPI stores the
+key with a unique constraint and replays the original result. Django has
+its own unique key for the service-to-service call. Payments use row
+locks, and the event handler is idempotent. I proved it with concurrent
+tests: 6 parallel checkouts created exactly one order, and 6 parallel
+payments reduced stock only once."
+
+
+------------------------------------------------------------------
+LIKELY FOLLOW-UP QUESTIONS
+------------------------------------------------------------------
+Q: Why not just disable the button after the first click?
+A: That helps, but it doesn't cover a page refresh, a second tab, a lost
+   response or a retry between services. The server must be the
+   guarantee; the button is only a UX improvement.
+
+Q: Why 409 and not just wait on the server?
+A: Holding a connection open while another request finishes wastes server
+   resources. 409 + Retry-After is cheap, and the client simply asks
+   again.
+
+Q: Where is the key stored and for how long?
+A: In the shop DB (idempotency_records). In production I would add a
+   cleanup job (for example, delete records older than 24 hours).
+
+Q: What if Redis is down when the payment succeeds?
+A: Today the event would be lost (Pub/Sub is fire-and-forget). The fix is
+   the Transactional Outbox: save the event in the same DB commit as the
+   payment, and publish it later from a relay process.
